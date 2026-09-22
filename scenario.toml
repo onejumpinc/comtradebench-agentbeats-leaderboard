@@ -1,11 +1,11 @@
-# Default scenario (uses agentbeats_id for both agents)
-# CI uses scenario.ci.toml
+# Public submission scenario. Replace COMTRADE_AGENT_ID only after the
+# digest-pinned participant has been registered on AgentBeats.
 
 [green_agent]
 agentbeats_id = "019bd1bd-7774-73f1-b645-b192f262e843"
 
 [[participants]]
-agentbeats_id = "019bd217-12bc-7ba0-9ef6-44370aba46a2"
+agentbeats_id = "COMTRADE_AGENT_ID"
 name = "purple-comtrade-baseline-v2"
 env = {}
 

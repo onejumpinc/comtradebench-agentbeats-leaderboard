@@ -2,219 +2,584 @@ name: Run Scenario
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'scenario.ci.toml'
-      - '.github/workflows/run-scenario.yml'
-      - 'generate_compose.py'
-      - 'record_provenance.py'
+
+concurrency:
+  group: comtradebench-submission-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    env:
-      GREEN_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2:1a7cb5c1e3797dc5fe0de9740cd3e23b5d881454
-      PURPLE_IMAGE: ghcr.io/yonghongzhang-io/purple-comtrade-baseline-v2:e76fe350feff7e7347b9d81950141d893e5c92af
-      MOCK_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2-mock:1a7cb5c1e3797dc5fe0de9740cd3e23b5d881454
-    if: github.event.repository.fork == true || github.ref == 'refs/heads/main'
+    timeout-minutes: 30
+    if: github.event_name == 'workflow_dispatch' && github.event.repository.fork == true && github.ref == 'refs/heads/main'
     permissions:
       contents: write
-      packages: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      COMPOSE_FILE: docker-compose.yml
+      COMTRADE_AGENT_ID: 'COMTRADE_AGENT_ID'
+      GREEN_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2@sha256:a4efb6cf1afd06ded07ffa34223fbdcd4d735188f6efbbdb6b78694981a8cbf0
+      MOCK_IMAGE: ghcr.io/yonghongzhang-io/green-comtrade-bench-v2-mock@sha256:517485a83a13edd5591673422d66e4b509b3163f841473f4afbebdfaa9cfb634
+      PARTICIPANT_IMAGE: ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:e22724362f756ad89115f406ff376ea6263375e76eebe574bedfdc0d9454239c
+      PURPLE_IMAGE: ghcr.io/onejumpinc/comtrade-deterministic-agent@sha256:e22724362f756ad89115f406ff376ea6263375e76eebe574bedfdc0d9454239c
+      PARTICIPANT_MANIFEST_URL: https://raw.githubusercontent.com/onejumpinc/comtrade-deterministic-agent/7f4220c4e4c43a5c0258084d756597e5cdebae57/amber-manifest.json5
+      PARTICIPANT_MANIFEST_SHA256: 046ec8a43b899eebf09e7ce8ea3d7662963320c1b155d4a7f70a5f6ce586b1dc
+      CLIENT_IMAGE: ghcr.io/agentbeats/agentbeats-client@sha256:13dfe3ef4e583a80e7ce2fe3becd0ce3b879841368a7f4fa40b6ebbabeeb014e
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install tomli tomli-w pyyaml requests
+      - name: Install pinned runner dependencies
+        run: >-
+          python -m pip install --disable-pip-version-check
+          tomli==2.2.1 tomli-w==1.2.0 pyyaml==6.0.3 requests==2.34.2
 
-      - name: Generate docker-compose.yml
-        run: python generate_compose.py --scenario scenario.ci.toml
-
-      - name: Debug agentbeats-client config
+      - name: Verify exact scenario and AgentBeats registration
         run: |
+          test ! -e .env
+          test ! -e .env.example
           python - <<'PY'
-          import yaml
-          with open("docker-compose.yml") as f:
-              data = yaml.safe_load(f)
-          svc = data.get("services", {}).get("agentbeats-client", {})
-          print("=== agentbeats-client service config ===")
-          print(f"image: {svc.get('image')}")
-          print(f"entrypoint: {svc.get('entrypoint')}")
-          print(f"command: {svc.get('command')}")
+          import json
+          import os
+          import re
+          import sys
+          import tomllib
+
+          import requests
+
+
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
+
+
+          agent_id = os.environ["COMTRADE_AGENT_ID"]
+          if not re.fullmatch(
+              r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+              agent_id,
+          ):
+              fail(f"COMTRADE_AGENT_ID is not a lowercase UUID: {agent_id!r}")
+
+          task_ids = [
+              "T1_single_page",
+              "T2_multi_page",
+              "T3_duplicates",
+              "T4_rate_limit_429",
+              "T5_server_error_500",
+              "T6_page_drift",
+              "T7_totals_trap",
+          ]
+          with open("scenario.toml", "rb") as scenario_file:
+              scenario = tomllib.load(scenario_file)
+          expected = {
+              "green_agent": {
+                  "agentbeats_id": "019bd1bd-7774-73f1-b645-b192f262e843",
+              },
+              "participants": [
+                  {
+                      "agentbeats_id": agent_id,
+                      "name": "purple-comtrade-baseline-v2",
+                      "env": {},
+                  }
+              ],
+              "config": {"tasks": task_ids},
+          }
+          if json.dumps(scenario, sort_keys=True) != json.dumps(expected, sort_keys=True):
+              fail(f"scenario.toml mismatch: {scenario!r}")
+
+          response = requests.get(
+              f"https://agentbeats.dev/api/agents/{agent_id}",
+              headers={
+                  "User-Agent": (
+                      "comtradebench-leaderboard/1.0 "
+                      "(+https://github.com/onejumpinc/comtradebench-agentbeats-leaderboard)"
+                  )
+              },
+              timeout=30,
+          )
+          response.raise_for_status()
+          registered = response.json()
+          if registered.get("id") != agent_id:
+              fail(f"registration id={registered.get('id')!r}")
+          if registered.get("creator_name") != "onejumpinc":
+              fail(f"registration creator={registered.get('creator_name')!r}")
+          if registered.get("color") != "purple":
+              fail(f"registration color={registered.get('color')!r}")
+          if registered.get("category_slug") != "finance":
+              fail(f"registration category={registered.get('category_slug')!r}")
+          if (registered.get("repo_link") or "").rstrip("/") != (
+              "https://github.com/onejumpinc/comtrade-deterministic-agent"
+          ):
+              fail(f"registration repo={registered.get('repo_link')!r}")
+
+          locator = (
+              registered.get("docker_image"),
+              registered.get("amber_manifest_url"),
+          )
+          allowed = {
+              (os.environ["PARTICIPANT_IMAGE"], None),
+              (None, os.environ["PARTICIPANT_MANIFEST_URL"]),
+              (
+                  os.environ["PARTICIPANT_IMAGE"],
+                  os.environ["PARTICIPANT_MANIFEST_URL"],
+              ),
+          }
+          if locator not in allowed:
+              fail(f"unexpected registration locator={locator!r}")
+          print("Exact seven-task scenario and AgentBeats registration verified")
           PY
 
-      - name: Patch docker-compose for agentbeats-client
+          manifest_path="$RUNNER_TEMP/comtrade-participant-manifest.json5"
+          curl --fail --silent --show-error --location \
+            --output "$manifest_path" "$PARTICIPANT_MANIFEST_URL"
+          printf '%s  %s\n' "$PARTICIPANT_MANIFEST_SHA256" "$manifest_path" \
+            | sha256sum --check --strict
+          grep --fixed-strings --quiet "$PARTICIPANT_IMAGE" "$manifest_path"
+
+      - name: Generate exact Docker Compose inputs
+        run: |
+          python generate_compose.py --scenario scenario.toml
+          test ! -e .env
+          test ! -e .env.example
+
+      - name: Pin and verify exact runtime topology
         run: |
           python - <<'PY'
+          import os
+          import sys
+          import tomllib
+
           import yaml
 
-          path = "docker-compose.yml"
-          with open(path, "r", encoding="utf-8") as f:
-              data = yaml.safe_load(f)
 
-          services = (data or {}).get("services", {})
-          svc = services.get("agentbeats-client")
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
 
-          if not svc:
-              raise SystemExit("agentbeats-client service not found in docker-compose.yml")
 
-          # Remove any entrypoint override - let the image use its default ENTRYPOINT
-          svc.pop("entrypoint", None)
+          def require_equal(actual, expected, name):
+              if actual != expected:
+                  fail(f"unexpected {name}: {actual!r}")
 
-          # Set command to use container paths
-          svc["command"] = ["/app/scenario.toml", "/app/output/results.json"]
 
-          with open(path, "w", encoding="utf-8") as f:
-              yaml.safe_dump(data, f, sort_keys=False)
+          with open("a2a-scenario.toml", "rb") as scenario_file:
+              a2a_scenario = tomllib.load(scenario_file)
+          expected_tasks = [
+              "T1_single_page",
+              "T2_multi_page",
+              "T3_duplicates",
+              "T4_rate_limit_429",
+              "T5_server_error_500",
+              "T6_page_drift",
+              "T7_totals_trap",
+          ]
+          expected_a2a = {
+              "green_agent": {"endpoint": "http://green-agent:9009"},
+              "participants": [
+                  {
+                      "role": "purple-comtrade-baseline-v2",
+                      "endpoint": "http://purple-comtrade-baseline-v2:9009",
+                      "agentbeats_id": os.environ["COMTRADE_AGENT_ID"],
+                  }
+              ],
+              "config": {"tasks": expected_tasks},
+          }
+          require_equal(a2a_scenario, expected_a2a, "a2a-scenario.toml")
 
-          print("Patched docker-compose.yml:")
-          print("  entrypoint: (removed, using image default)")
-          print("  command: ['/app/scenario.toml', '/app/output/results.json']")
-          print()
-          print("===== agentbeats-client section =====")
-          print(yaml.safe_dump({"agentbeats-client": svc}, sort_keys=False))
+          with open("docker-compose.yml", encoding="utf-8") as compose_file:
+              compose = yaml.safe_load(compose_file)
+          require_equal(set(compose), {"services", "volumes", "networks"}, "Compose keys")
+          require_equal(compose["volumes"], {"purple_output": None}, "Compose volumes")
+          require_equal(
+              compose["networks"],
+              {"agent-network": {"driver": "bridge"}},
+              "Compose networks",
+          )
+
+          services = compose["services"]
+          require_equal(
+              set(services),
+              {
+                  "mock-comtrade",
+                  "green-agent",
+                  "purple-comtrade-baseline-v2",
+                  "agentbeats-client",
+              },
+              "Compose services",
+          )
+          expected_images = {
+              "mock-comtrade": os.environ["MOCK_IMAGE"],
+              "green-agent": os.environ["GREEN_IMAGE"],
+              "purple-comtrade-baseline-v2": os.environ["PARTICIPANT_IMAGE"],
+              "agentbeats-client": "ghcr.io/agentbeats/agentbeats-client:v1.0.0",
+          }
+          for name, expected_image in expected_images.items():
+              service = services[name]
+              require_equal(service.get("image"), expected_image, f"{name} image")
+              require_equal(service.get("platform"), "linux/amd64", f"{name} platform")
+              if "build" in service:
+                  fail(f"{name} unexpectedly has a build section")
+
+          common_command = [
+              "--host",
+              "0.0.0.0",
+              "--port",
+              "9009",
+              "--card-url",
+          ]
+          require_equal(
+              services["green-agent"].get("command"),
+              common_command + ["http://green-agent:9009"],
+              "green command",
+          )
+          require_equal(
+              services["purple-comtrade-baseline-v2"].get("command"),
+              common_command + ["http://purple-comtrade-baseline-v2:9009"],
+              "participant command",
+          )
+          require_equal(
+              services["green-agent"].get("depends_on"),
+              {
+                  "mock-comtrade": {"condition": "service_healthy"},
+                  "purple-comtrade-baseline-v2": {"condition": "service_healthy"},
+              },
+              "green dependencies",
+          )
+          require_equal(
+              services["purple-comtrade-baseline-v2"].get("depends_on"),
+              {"mock-comtrade": {"condition": "service_healthy"}},
+              "participant dependencies",
+          )
+          require_equal(
+              services["agentbeats-client"].get("depends_on"),
+              {
+                  "green-agent": {"condition": "service_healthy"},
+                  "purple-comtrade-baseline-v2": {"condition": "service_healthy"},
+              },
+              "client dependencies",
+          )
+          require_equal(
+              services["agentbeats-client"].get("volumes"),
+              [
+                  "./a2a-scenario.toml:/app/scenario.toml",
+                  "./output:/app/output",
+              ],
+              "client volumes",
+          )
+          require_equal(
+              services["agentbeats-client"].get("command"),
+              ["scenario.toml", "output/results.json"],
+              "generated client command",
+          )
+          for name in ("green-agent", "purple-comtrade-baseline-v2"):
+              require_equal(
+                  services[name].get("volumes"),
+                  ["purple_output:/workspace/purple_output"],
+                  f"{name} volumes",
+              )
+              require_equal(
+                  services[name].get("environment"),
+                  ["PYTHONUNBUFFERED=1"],
+                  f"{name} environment",
+              )
+
+          client = services["agentbeats-client"]
+          client.pop("entrypoint", None)
+          client["image"] = os.environ["CLIENT_IMAGE"]
+          client["command"] = ["/app/scenario.toml", "/app/output/results.json"]
+          with open("docker-compose.yml", "w", encoding="utf-8") as compose_file:
+              yaml.safe_dump(compose, compose_file, sort_keys=False)
           PY
 
-      - name: Debug docker-compose.yml
+          docker compose config --format json | jq -e \
+            --arg green "$GREEN_IMAGE" \
+            --arg mock "$MOCK_IMAGE" \
+            --arg participant "$PARTICIPANT_IMAGE" \
+            --arg client "$CLIENT_IMAGE" '
+              (.services | keys) == [
+                "agentbeats-client",
+                "green-agent",
+                "mock-comtrade",
+                "purple-comtrade-baseline-v2"
+              ]
+              and .services["green-agent"].image == $green
+              and .services["mock-comtrade"].image == $mock
+              and .services["purple-comtrade-baseline-v2"].image == $participant
+              and .services["agentbeats-client"].image == $client
+              and .services["agentbeats-client"].command == [
+                "/app/scenario.toml",
+                "/app/output/results.json"
+              ]
+              and ([.services[] | select(has("build"))] | length) == 0
+            ' >/dev/null
+
+      - name: Pull immutable public images
+        run: docker compose pull
+
+      - name: Create clean output directory
+        run: install -d -m 0777 output
+
+      - name: Run seven-task public assessment
+        run: >-
+          docker compose up --timestamps --no-color
+          --exit-code-from agentbeats-client --abort-on-container-exit
+
+      - name: Capture runtime logs
+        if: always()
         run: |
-          echo "===== docker-compose.yml (after patch) ====="
-          cat docker-compose.yml
-          echo "==========================================="
+          mkdir -p output
+          docker compose logs --no-color mock-comtrade > output/mock.log 2>&1 || true
+          docker compose logs --no-color green-agent > output/green.log 2>&1 || true
+          docker compose logs --no-color purple-comtrade-baseline-v2 > output/participant.log 2>&1 || true
 
-      - name: Check GHCR_TOKEN is set
-        run: |
-          if [ -z "${{ secrets.GHCR_TOKEN }}" ]; then
-            echo "GHCR_TOKEN is missing. Add a repo secret GHCR_TOKEN with a PAT that has read:packages."
-            exit 1
-          fi
-
-      - name: Login to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ secrets.GHCR_TOKEN }}
-
-      - name: Pull images
-        run: |
-          if ! docker compose pull; then
-            echo ""
-            echo "Error: Failed to pull one or more images."
-            echo "Ensure all images are publicly accessible."
-            echo "For ghcr.io images, check package settings at:"
-            echo "  https://github.com/orgs/YOUR_ORG/packages or"
-            echo "  https://github.com/users/YOUR_USER/packages"
-            exit 1
-          fi
-
-      - name: Debug image digests
-        run: |
-          echo "===== Pulled images ====="
-          docker images --digests | grep -E "green-comtrade-bench-v2|purple-comtrade-baseline-v2" || true
-          echo ""
-          echo "GREEN_IMAGE=$GREEN_IMAGE"
-          docker inspect --format='{{index .RepoDigests 0}}' "$GREEN_IMAGE" 2>/dev/null || echo "(not found)"
-          echo ""
-          echo "PURPLE_IMAGE=$PURPLE_IMAGE"
-          docker inspect --format='{{index .RepoDigests 0}}' "$PURPLE_IMAGE" 2>/dev/null || echo "(not found)"
-
-      - name: Create output directory
-        run: mkdir -p output && chmod 777 output
-
-      - name: Install jq
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Export secrets as environment variables
-        env:
-          SECRETS_JSON: ${{ toJSON(secrets) }}
-        run: |
-          echo "$SECRETS_JSON" | jq -r 'to_entries|map("\(.key)=\(.value)")|.[]' > .env
-
-      - name: Debug agent cards
-        run: |
-          echo "===== Starting agent services for health check ====="
-          docker compose up -d green-agent purple-comtrade-baseline-v2
-          echo "Waiting for agents to be healthy (max 90s)..."
-          timeout 90 bash -c 'until docker compose ps | grep -E "(green-agent|purple-comtrade-baseline-v2)" | grep -q "(healthy)"; do sleep 2; done' || true
-          echo ""
-          echo "===== Container Status ====="
-          docker compose ps -a
-          echo ""
-          echo "===== Purple Agent Logs ====="
-          docker compose logs purple-comtrade-baseline-v2 2>&1 | tail -100 || echo "(no logs)"
-          echo ""
-          echo "===== Green Agent Logs ====="
-          docker compose logs green-agent 2>&1 | tail -50 || echo "(no logs)"
-          echo ""
-          echo "===== Green Agent Card ====="
-          docker compose exec -T green-agent curl -f http://localhost:9009/.well-known/agent-card.json | jq . || echo "FAILED"
-          echo ""
-          echo "===== Purple Agent Card ====="
-          docker compose exec -T purple-comtrade-baseline-v2 curl -f http://localhost:9009/.well-known/agent-card.json | jq . || echo "FAILED"
-          echo ""
-          echo "===== Stopping debug containers ====="
-          docker compose down
-          echo ""
-
-      - name: Run assessment
-        run: docker compose up --timestamps --no-color --exit-code-from agentbeats-client --abort-on-container-exit
-
-      - name: Record provenance
+      - name: Record immutable provenance
         run: python record_provenance.py --compose docker-compose.yml --output output/provenance.json
+
+      - name: Verify exact 700/700 result, live faults, and provenance
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+
+          def fail(message):
+              sys.exit(f"Gate failed: {message}")
+
+
+          def load_json(path):
+              with open(path, encoding="utf-8") as source:
+                  return json.load(
+                      source,
+                      parse_constant=lambda value: fail(
+                          f"non-finite number {value!r} in {path}"
+                      ),
+                  )
+
+
+          results = load_json("output/results.json")
+          if not isinstance(results, dict) or set(results) != {"participants", "results"}:
+              fail(f"unexpected result document={results!r}")
+          expected_participants = {
+              "purple-comtrade-baseline-v2": os.environ["COMTRADE_AGENT_ID"]
+          }
+          if results["participants"] != expected_participants:
+              fail(f"participants={results['participants']!r}")
+          if not isinstance(results["results"], list) or len(results["results"]) != 1:
+              fail("expected exactly one assessment result list")
+          task_results = results["results"][0]
+          if not isinstance(task_results, list) or len(task_results) != 7:
+              fail(f"expected seven task results, got {task_results!r}")
+
+          expected_tasks = {
+              "T1_single_page": (800, 1, 1),
+              "T2_multi_page": (2345, 5, 5),
+              "T3_duplicates": (25, 3, 3),
+              "T4_rate_limit_429": (30, 4, 4),
+              "T5_server_error_500": (30, 4, 4),
+              "T6_page_drift": (36, 2, 3),
+              "T7_totals_trap": (750, 3, 8),
+          }
+          expected_breakdown = {
+              "correctness": 30.0,
+              "completeness": 15.0,
+              "robustness": 15.0,
+              "efficiency": 15.0,
+              "data_quality": 15.0,
+              "observability": 10.0,
+          }
+          if [result.get("task_id") for result in task_results] != list(expected_tasks):
+              fail("task order or identity mismatch")
+
+          score_sum = 0.0
+          for result in task_results:
+              task_id = result["task_id"]
+              if set(result) != {
+                  "task_id", "score_total", "score_breakdown", "errors", "details"
+              }:
+                  fail(f"unexpected {task_id} result keys={sorted(result)}")
+              if type(result["score_total"]) is not float or result["score_total"] != 100.0:
+                  fail(f"{task_id} score={result['score_total']!r}")
+              score_sum += result["score_total"]
+              if result["score_breakdown"] != expected_breakdown:
+                  fail(f"{task_id} breakdown={result['score_breakdown']!r}")
+              if result["errors"] != []:
+                  fail(f"{task_id} errors={result['errors']!r}")
+
+              rows, requests, baseline = expected_tasks[task_id]
+              details = result["details"]
+              for key, expected in (
+                  ("row_count_actual", rows),
+                  ("row_count_declared", rows),
+                  ("dedup_total_rows", rows),
+                  ("dedup_unique_rows", rows),
+                  ("request_count", requests),
+                  ("efficiency_baseline_requests", baseline),
+              ):
+                  if type(details.get(key)) is not int or details[key] != expected:
+                      fail(f"{task_id}.{key}={details.get(key)!r}, expected {expected}")
+              for key in (
+                  "row_accuracy_pct",
+                  "schema_completeness_pct",
+                  "dedup_quality_pct",
+                  "request_efficiency_pct",
+                  "data_integrity_pct",
+                  "type_consistency_pct",
+                  "value_range_pct",
+                  "traceability_pct",
+              ):
+                  if details.get(key) != 100.0:
+                      fail(f"{task_id}.{key}={details.get(key)!r}")
+              if details.get("time_penalty_applied") is not False:
+                  fail(f"{task_id} time penalty was applied")
+              if details.get("has_stop_reason") is not True:
+                  fail(f"{task_id} has no stop reason")
+              if details.get("traceable_fields_missing") != []:
+                  fail(f"{task_id} missing trace fields")
+              if "governance_rules_applied" in details:
+                  fail(f"{task_id} had governance rules applied")
+              for key in ("data_sha256", "metadata_sha256"):
+                  if not re.fullmatch(r"[0-9a-f]{64}", details.get(key, "")):
+                      fail(f"{task_id}.{key}={details.get(key)!r}")
+          if score_sum != 700.0:
+              fail(f"aggregate score={score_sum!r}")
+
+          mock_log = open("output/mock.log", encoding="utf-8").read()
+          green_log = open("output/green.log", encoding="utf-8").read()
+          participant_log = open("output/participant.log", encoding="utf-8").read()
+          log_checks = {
+              "mock GET /records": (mock_log.count('"GET /records'), 22),
+              "mock POST /configure": (mock_log.count('"POST /configure'), 7),
+              "mock 429": (mock_log.count("429 Too Many Requests"), 1),
+              "mock 500": (mock_log.count("500 Internal Server Error"), 1),
+              "participant requests": (participant_log.count("event=request_started"), 22),
+              "participant 429": (participant_log.count("status=429"), 1),
+              "participant 500": (participant_log.count("status=500"), 1),
+              "participant configure": (participant_log.count("/configure"), 0),
+              "green task starts": (green_log.count("Starting task:"), 7),
+              "green perfect scores": (green_log.count("scored: 100.0"), 7),
+          }
+          for name, (actual, expected) in log_checks.items():
+              if actual != expected:
+                  fail(f"{name} count={actual}, expected {expected}")
+
+          provenance = load_json("output/provenance.json")
+          if set(provenance) != {"image_digests", "timestamp", "github_actions"}:
+              fail(f"unexpected provenance={provenance!r}")
+          expected_digests = {
+              "mock-comtrade": os.environ["MOCK_IMAGE"],
+              "green-agent": os.environ["GREEN_IMAGE"],
+              "purple-comtrade-baseline-v2": os.environ["PARTICIPANT_IMAGE"],
+              "agentbeats-client": os.environ["CLIENT_IMAGE"],
+          }
+          if provenance["image_digests"] != expected_digests:
+              fail(f"image digests={provenance['image_digests']!r}")
+          if not re.fullmatch(
+              r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z",
+              provenance.get("timestamp", ""),
+          ):
+              fail(f"timestamp={provenance.get('timestamp')!r}")
+          expected_actions = {
+              "run_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+              ),
+              "run_logs_url": (
+                  f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+                  f"/actions/runs/{os.environ['GITHUB_RUN_ID']}/logs"
+              ),
+              "ref": os.environ["GITHUB_REF"],
+              "sha": os.environ["GITHUB_SHA"],
+              "repository_url": (
+                  f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}"
+              ),
+              "workflow_ref": os.environ["GITHUB_WORKFLOW_REF"],
+              "workflow_sha": os.environ["GITHUB_WORKFLOW_SHA"],
+          }
+          if provenance["github_actions"] != expected_actions:
+              fail(f"GitHub Actions provenance={provenance['github_actions']!r}")
+          print("Exact ComtradeBench score and provenance verified: 700/700")
+          PY
+
+      - name: Preserve public-run evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: comtradebench-public-run-${{ github.run_id }}
+          path: |
+            output/
+            a2a-scenario.toml
+            docker-compose.yml
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Generate submission metadata
         id: metadata
         run: |
-          TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-          USERNAME=${{ github.repository_owner }}
-          UNIQUE_NAME="${USERNAME}-${TIMESTAMP}"
-          echo "unique_name=$UNIQUE_NAME" >> $GITHUB_OUTPUT
-          echo "branch_name=submission-${UNIQUE_NAME}" >> $GITHUB_OUTPUT
+          timestamp=$(date +%Y%m%d-%H%M%S)
+          username='${{ github.repository_owner }}'
+          unique_name="${username}-${timestamp}"
+          {
+            echo "unique_name=${unique_name}"
+            echo "branch_name=submission-${unique_name}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Copy files to submission directory
+      - name: Copy exact-gated submission files
         run: |
-          cp scenario.ci.toml submissions/${{ steps.metadata.outputs.unique_name }}.toml
-          cp output/results.json results/${{ steps.metadata.outputs.unique_name }}.json
-          cp output/provenance.json submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json
+          cp scenario.toml "submissions/${{ steps.metadata.outputs.unique_name }}.toml"
+          cp output/results.json "results/${{ steps.metadata.outputs.unique_name }}.json"
+          cp output/provenance.json "submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json"
 
       - name: Determine target repository
         id: target
         env:
-            GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ github.token }}
         run: |
-            PARENT_REPO=$(gh api repos/${{ github.repository }} --jq '.parent.full_name // "${{ github.repository }}"')
-            echo "Target repository: $PARENT_REPO"
-            echo "repo=$PARENT_REPO" >> $GITHUB_OUTPUT
+          parent_repo=$(gh api "repos/${{ github.repository }}" \
+            --jq '.parent.full_name // "${{ github.repository }}"')
+          echo "Target repository: ${parent_repo}"
+          echo "repo=${parent_repo}" >> "$GITHUB_OUTPUT"
 
-      - name: Create submission branch
+      - name: Create submission branch from upstream main
         run: |
-          git remote add upstream https://github.com/${{ steps.target.outputs.repo }}.git
-          git fetch upstream
-          git checkout -b ${{ steps.metadata.outputs.branch_name }} upstream/main
+          git remote add submission-upstream "https://github.com/${{ steps.target.outputs.repo }}.git"
+          git fetch submission-upstream main
+          git checkout -b "${{ steps.metadata.outputs.branch_name }}" submission-upstream/main
 
-      - name: Commit results
+      - name: Commit exact-gated results
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: credential.helper
+          GIT_CONFIG_VALUE_0: '!f() { printf "username=x-access-token\npassword=%s\n" "$GH_TOKEN"; }; f'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add submissions/${{ steps.metadata.outputs.unique_name }}.toml submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json results/${{ steps.metadata.outputs.unique_name }}.json
+          git add \
+            "submissions/${{ steps.metadata.outputs.unique_name }}.toml" \
+            "submissions/${{ steps.metadata.outputs.unique_name }}.provenance.json" \
+            "results/${{ steps.metadata.outputs.unique_name }}.json"
           git commit -m "Submission: ${{ steps.metadata.outputs.unique_name }}
 
           Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          git push origin ${{ steps.metadata.outputs.branch_name }}
-          echo "::notice title=Submission Branch Created::Your results are ready for submission on branch: ${{ steps.metadata.outputs.branch_name }}"
+          git push origin "${{ steps.metadata.outputs.branch_name }}"
+          echo "::notice title=Submission Branch Created::${{ steps.metadata.outputs.branch_name }}"
 
-      - name: Output PR link
+      - name: Output pull request link
         run: |
-          echo "### Submit your results" >> $GITHUB_STEP_SUMMARY
-          echo "[Click here to open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ When creating the PR, UNCHECK 'Allow edits and access to secrets by maintainers' to protect your secrets." >> $GITHUB_STEP_SUMMARY
+          {
+            echo "### Submit exact-gated ComtradeBench results"
+            echo "[Open a pull request](https://github.com/${{ steps.target.outputs.repo }}/compare/main...${{ github.repository_owner }}:${{ github.event.repository.name }}:${{ steps.metadata.outputs.branch_name }}?expand=1)"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Cleanup
         if: always()

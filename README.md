@@ -32,13 +32,30 @@ The authoritative benchmark logic is implemented in the Green agent / judge repo
 
 ## Submission workflow
 
-1. Fork this repository.
-2. Configure your AgentBeats agent identifier in `scenario.toml`.
-3. Add required secrets through GitHub Actions Secrets if needed.
-4. Push your changes to trigger automated assessment.
-5. Inspect the workflow summary and generated evaluation artifacts.
+This fork stages the independently verified One Jump participant for a public
+run. Its exact image earned `700/700` in each of two fresh full-stack suites in
+[release run 35687874930](https://github.com/onejumpinc/comtrade-deterministic-agent/actions/runs/35687874930).
 
-Do not commit credentials or private tokens to the repository.
+The workflow is deliberately manual-only and currently inert:
+`COMTRADE_AGENT_ID` is a placeholder in the workflow, `scenario.toml`, and the
+compatibility copy `scenario.ci.toml`. After the digest-pinned manifest has
+been registered on AgentBeats, replace all three occurrences with the resulting
+lowercase UUID and dispatch the workflow from `main`.
+
+Before creating a submission branch, the workflow verifies:
+
+- the AgentBeats registration owner, color, category, repository, and immutable
+  image or manifest locator;
+- the pinned manifest checksum and exact green, mock, participant, and client
+  image digests;
+- all seven task identities, exact row/request counts, every score component,
+  empty judge errors, and an aggregate score of `700/700`;
+- real HTTP 429/500 behavior, seven green-owned mock configurations, no
+  participant `/configure` call, and complete GitHub Actions provenance.
+
+No registry or model secret is required because every runtime image is public
+and the participant is model-free. A branch suitable for an upstream pull
+request is created only after all gates pass.
 
 ## Related repositories
 
